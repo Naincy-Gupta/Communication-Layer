@@ -1,0 +1,118 @@
+pipeline{
+
+ agent {
+        docker {
+            image 'nexus2.prod.cloud.fedex.com:8444/fdx/jenkins/default-tools-image'
+            label 'docker'
+        }
+    }
+
+	parameters {
+		string(defaultValue: "ST-Titans-Device@corp.ds.fedex.com", description: 'Success Email List', name: 'successEmail')
+		string(defaultValue: "ST-Titans-Device@corp.ds.fedex.com", description: 'Failure Email List', name: 'errorEmail')
+		gitParameter(branch: '', branchFilter: '.*', defaultValue: 'origin/master', description: 'Branch to take checkout and run  pipeline on', listSize: '10', name: 'checkoutBranch', quickFilterEnabled: true, selectedValue: 'NONE', sortMode: 'NONE', tagFilter: '*', type: 'PT_BRANCH')
+		booleanParam(defaultValue: false, description: 'if set to true the release will deploy to Nexus else snapshot will deploy', name: 'isRelease')
+	}
+
+	options {
+		buildDiscarder(logRotator(numToKeepStr: '20'))
+	}
+
+	tools {
+		jdk 'JAVA_8'
+		maven 'Maven 3.3.9'
+	}
+
+	stages{
+		stage ('pre-checkout-stage')
+		{
+			steps
+			{
+				script
+				{
+					release=params.isRelease
+					gitlabCheckoutBranch=params.checkoutBranch
+					if(currentBuild.rawBuild.getCause(hudson.model.Cause$UserIdCause) == null)
+					{
+						echo "****** Build is triggered automatically ******"					
+						if("${env.gitlabTargetBranch}"=="master")
+						{
+							release=true
+							gitlabCheckoutBranch="master"
+							echo "triggering a release of artifact as the change is pushed to master branch"
+						}
+						if("${env.gitlabTargetBranch}"=="develop")
+						{
+							release=false
+							gitlabCheckoutBranch="develop"
+							echo "triggering a deploy of artifact as the change is pushed to develop branch"
+						}
+					}
+					else
+					{
+						echo "****** Build is triggered manually ******"
+					}
+					echo "****** branch of which checkout is to be taken: ${gitlabCheckoutBranch} *****"
+					echo "****** is release of the artifact will be triggered: ${release} *****"
+				}
+			}
+		}
+		
+		stage('checkout'){
+			steps{
+				checkout([$class: 'GitSCM', branches: [[name: "${gitlabCheckoutBranch}"]], doGenerateSubmoduleConfigurations: false, extensions: [[$class: 'WipeWorkspace'], [$class: 'LocalBranch']], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '49da154a-96fe-49dd-9dc1-1300a07dc02a', url: 'git@gitlab.prod.fedex.com:APP3530951/peripheral-otp-communication-layer.git']]])
+			}
+		}
+
+		stage('Build'){
+			steps {
+				echo "This is the build step"
+				sh "mvn clean package -s settings.xml -U -Dmaven.test.skip=true"
+			}
+		}
+		
+		stage('Deploy to Nexus'){
+		when{ equals expected: false, actual: release }
+			steps
+			{
+				echo "This step publishes the Snapshot jar to Nexus Snapshot Repository"
+				script {
+					withCredentials([usernamePassword(credentialsId: 'peripheral-server-nexus-jenkins-deployment', passwordVariable: 'NEXUS_PASSWORD', usernameVariable: 'NEXUS_USERNAME')])
+					{
+						sh "mvn clean deploy -s settings.xml -DNEXUS.USER=$NEXUS_USERNAME -DNEXUS.PASSWORD=$NEXUS_PASSWORD -U -Dmaven.test.skip=true"
+					}
+				}
+			}
+		}
+		
+		
+		stage('Release to Nexus'){
+			when{ equals expected: true, actual: release }
+			steps
+			{
+			
+				echo "This step publishes the release jar to Nexus Release Repository"
+				script {
+					withCredentials([usernamePassword(credentialsId: 'peripheral-server-nexus-jenkins-deployment', passwordVariable: 'NEXUS_PASSWORD', usernameVariable: 'NEXUS_USERNAME')])
+					{
+						sshagent(credentials: ['49da154a-96fe-49dd-9dc1-1300a07dc02a'], ignoreMissing: true)
+						{
+							sh "mkdir ~/.ssh && ssh-keyscan gitlab.prod.fedex.com >> ~/.ssh/known_hosts"
+							sh "git config user.name Jenkins"
+							sh "git config user.email Jenkins@fedex.com"
+							sh "mvn release:clean release:prepare org.apache.maven.plugins:maven-release-plugin:2.5.3:perform -s settings.xml -DNEXUS.USER=$NEXUS_USERNAME -DNEXUS.PASSWORD=$NEXUS_PASSWORD -U -Denv=production"
+						}
+					}
+				}
+			}
+		}
+	}
+	post {
+		failure{    // notify users when the Pipeline fails
+			mail(to: params.errorEmail, subject: "Jenkins RTL-Peripheral Server Communication Layer Pipeline Failure Notice", body: "**************** SOMETHING WENT WRONG **********************\n\nHi\n\nThe Application Continuous Delivery pipeline for RTL-Peripheral Server Communication Layer Application failed. \n\nThe Link to the failed Jenkins pipeline can be found here: \n\n${env.BUILD_URL} \n\nPlease navigate to the above mentioned Jenkins job to see the logs.\n\nThanks!")
+		}
+		success{    // notify users when the Pipeline succeeds
+			mail(to: params.successEmail, subject: "Jenkins RTL-Peripheral Server Communication Layer Pipeline Executed Successfully", body: "**************** Application Publish Successful **********************\n\nHi\n\nThe Application Continuous Delivery pipeline for RTL-Peripheral Server Communication Layer Application is Successfully executed. \n\nThe Link to the Successful Jenkins pipeline can be found here: \n\n${env.BUILD_URL} \n\nPlease navigate to the above mentioned Jenkins job to see the logs.\n\nThanks!")
+		}
+	}
+}
